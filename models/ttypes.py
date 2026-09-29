@@ -152,9 +152,8 @@ class Weight(BaseClass):
     weight_name: str
     bracket_id: int
 
-    # TrackWrestling dropped divisions from BracketViewer's payload: weights used to carry a
-    # division id and no longer do. Optional rather than removed, so a tournament type that
-    # still sends the older four-field shape keeps its value. Nothing downstream reads it.
+    # Only open tournaments send divisions, so only their weights carry a division id.
+    # Predefined and team tournaments leave it as None.
     division_id: Optional[int] = None
 
 @dataclass
