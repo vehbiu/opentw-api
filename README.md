@@ -68,8 +68,15 @@ Returns detailed bracket information for a specific weight class.
 
 3. Run the server:
    ```
-   python app.py
+   python main.py
    ```
+   Host and port come from `HOST` and `PORT` (defaults `localhost:8000`).
+
+4. Check it still works against the live site:
+   ```
+   python smoke_test.py
+   ```
+   `python test_parsers.py` checks the parsing edge cases offline.
 
 The server will start on `localhost:8000` by default.
 
@@ -80,8 +87,21 @@ The API is built using:
 - aiohttp - Async HTTP client for fetching data
 - Custom parsers for extracting data from TrackWrestling HTML
 
+### A warning about the parsers
+
+This scrapes a site nobody here controls, and TrackWrestling changes it. The failures are
+quiet ones: a page that returns 200 with a different shape, a row silently dropped, a field
+that shifts one position. `smoke_test.py` exists because "it imports and the server starts"
+says nothing at all about whether the parsing still works.
+
+If something looks wrong, run the smoke test first - it checks the values, not just the
+status codes.
+
 ### Project Structure
-- `app.py` - Main application entry point
+- `main.py` - Entry point; reads HOST/PORT and runs the server
+- `server.py` - Sanic app and route definitions
+- `smoke_test.py` - End-to-end checks against the live site
+- `test_parsers.py` - Offline checks of the parsing edge cases
 - `models/` - Data models and types
 - `parsers/` - HTML parsing logic for different TrackWrestling views
 
