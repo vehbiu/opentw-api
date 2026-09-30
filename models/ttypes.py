@@ -150,8 +150,12 @@ class Weight(BaseClass):
     weight_index: int
     weight_id: int
     weight_name: str
-    division_id: int
     bracket_id: int
+
+    # TrackWrestling dropped divisions from BracketViewer's payload: weights used to carry a
+    # division id and no longer do. Optional rather than removed, so a tournament type that
+    # still sends the older four-field shape keeps its value. Nothing downstream reads it.
+    division_id: Optional[int] = None
 
 @dataclass
 class BracketType(BaseClass):
@@ -166,3 +170,90 @@ class BracketData(BaseClass):
     bracket_types: List[BracketType]
 
 
+
+
+@dataclass
+class BracketEntry(BaseClass):
+    """One first-round slot on a bracket sheet, in bracket order.
+
+    `seed` is None where the sheet prints no seed; TrackWrestling renders an unseeded slot with a
+    non-breaking space, so "unseeded" comes from the page rather than being inferred.
+    `qualifying_rank` is Division III's trailing "(5)" - a regional rank, not a seed.
+    """
+    wrestler_id: str
+    team_id: str
+    name: str
+    school: str
+    seed: Optional[int] = None
+    record: Optional[str] = None
+    qualifying_rank: Optional[int] = None
+
+
+@dataclass
+class PigtailEntrant(BaseClass):
+    """A wrestler the sheet mentions who never holds a first-round slot.
+
+    `partial` is True when the sheet only prints a surname and team abbreviation
+    ("Schafer, BLOO") - D1 and D3 do this for pigtail losers - so `name` is not a full name.
+    """
+    wrestler_id: str
+    text: str
+    entry: BracketEntry
+    partial: bool
+
+
+Route = Literal["loser_of", "to_top_of", "to_bottom_of"]
+
+
+@dataclass
+class BracketRoute(BaseClass):
+    """A routing hint printed on the sheet: "To bottom of 11", "Loser of 19".
+
+    Only pigtails and consolation feeds carry these, and they are the part of a bracket that
+    varies by division (D2 sends pigtail winners to seeds 8 and 7, D3 to seeds 1-5).
+    """
+    kind: Route
+    bout: int
+
+
+@dataclass
+class BracketSheet(BaseClass):
+    entries: List[BracketEntry]
+    bout_numbers: List[int]
+    pigtail_entrants: List[PigtailEntrant]
+    routes: List[BracketRoute]
+
+
+@dataclass
+class BoutResult(BaseClass):
+    """One line of RoundResults.jsp.
+
+    `result_code` is kept exactly as the site writes it (Dec, MD, Fall, TF-1.5, SV-1, TB-2,
+    2-OT, Inj., DQ, M. For., MFFL, For). "M. For." and "MFFL" are the same outcome written two
+    ways; "For" is a plain forfeit. A line that cannot be read comes back with `parsed` False
+    and its `text` intact rather than being dropped.
+    """
+    round: str
+    weight: str
+    parsed: bool
+    text: str
+    bout_label: Optional[str] = None
+    winner: Optional[str] = None
+    winner_school: Optional[str] = None
+    winner_record: Optional[str] = None
+    loser: Optional[str] = None
+    loser_school: Optional[str] = None
+    loser_record: Optional[str] = None
+    method: Optional[str] = None
+    result: Optional[str] = None
+    result_code: Optional[str] = None
+    result_detail: Optional[str] = None
+
+
+@dataclass
+class TournamentResults(BaseClass):
+    bout_count: int
+    unparsed: int
+    rounds: List[str]
+    weights: List[str]
+    results: List[BoutResult]

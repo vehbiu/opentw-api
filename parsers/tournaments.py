@@ -1,26 +1,58 @@
 import re
+import logging
 from bs4 import BeautifulSoup
-from typing import List, Tuple
+from typing import Iterable, List, Tuple
 from utils import _get_timestamp
 from datetime import datetime, date
-from models.ttypes import Tournament, Wrestler, Match, Team, EventType, Status, Template, Weight, BracketType, BracketPage, BracketData, Division
+from models.ttypes import Tournament, Wrestler, Match, Team, EventType, Status, Template, Weight, BracketType, BracketPage, BracketData, Division, BracketSheet
 from utils.session_manager import session_manager
+from parsers.brackets import parse_bracket_sheet
 
-def _parse_date_range(date_str: str) -> tuple[date, date | None]:
-    parts = date_str.split(" - ")
-    start_str = parts[0].strip()
+_log = logging.getLogger(__name__)
 
-    if len(parts) == 1:
-        end_date = None
-    else:
-        end_str = parts[1].strip()
-        if "/" in start_str and len(start_str.split("/")) == 2:
-            year = end_str.split("/")[-1]
-            start_str = f"{start_str}/{year}"
-        end_date = datetime.strptime(end_str, "%m/%d/%Y").date()
+def _parse_date_range(date_str: str) -> tuple[date | None, date | None]:
+    """Parse TrackWrestling's date range into (start, end).
 
-    start_date = datetime.strptime(start_str, "%m/%d/%Y").date()
-    return start_date, end_date
+    Two shapes are in use and both appear on live pages:
+
+        03/19/2026 - 03/21/2026     both years given
+        03/19 - 03/21/2026          start omits the year, which the END carries
+
+    When the start borrows the end's year, a range that crosses New Year
+    ("12/30 - 01/02/2027") would put the start after the end, so the start rolls back a year.
+
+    The second is why the tournament hub reported a null start date: it fed the bare
+    "03/19" to a %m/%d/%Y parse, which fails, and the failure was swallowed.
+
+    Unparseable parts come back as None rather than raising. A tournament with an odd
+    date is still a tournament, and the search used to drop the whole row for it.
+    """
+    parts = [p.strip() for p in date_str.split(" - ") if p.strip()]
+
+    if not parts:
+        return None, None
+
+    start_str, end_str = parts[0], parts[1] if len(parts) > 1 else None
+
+    # Borrow the year from the end date when the start omits it.
+    borrowed_year = bool(end_str) and len(start_str.split("/")) == 2
+    if borrowed_year:
+        start_str = f"{start_str}/{end_str.split('/')[-1]}"
+
+    def parse(value: str | None) -> date | None:
+        if not value:
+            return None
+        try:
+            return datetime.strptime(value, "%m/%d/%Y").date()
+        except ValueError:
+            return None
+
+    start, end = parse(start_str), parse(end_str)
+
+    if borrowed_year and start and end and start > end:
+        start = start.replace(year=start.year - 1)
+
+    return start, end
 
 
 def _parse_venue_address(address_text: str) -> tuple[str, str, str, str, str]:
@@ -42,6 +74,45 @@ def _parse_venue_address(address_text: str) -> tuple[str, str, str, str, str]:
     return venue_name, street, city, state, zip_code
 
 
+def _split_js_args(raw: str) -> List[str]:
+    """Split the arguments of a JavaScript call, respecting quotes.
+
+    `eventSelected(123,'Some Open, 3rd-4th Grade',1,'logo.png')` has FOUR arguments, but a
+    plain `.split(",")` sees six and hands "3rd-4th Grade'" to int(). That dropped every
+    tournament whose name contains a comma — silently, because the loop swallowed the
+    ValueError.
+
+    Quotes are consumed here, so callers get the bare value. A backslash inside quotes
+    escapes the next character, so 'St. Mary\'s Open' comes back as St. Mary's Open.
+    """
+    args: List[str] = []
+    current: List[str] = []
+    quote: str | None = None
+    escaped = False
+
+    for ch in raw:
+        if escaped:
+            current.append(ch)
+            escaped = False
+        elif quote:
+            if ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            else:
+                current.append(ch)
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == ",":
+            args.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+
+    args.append("".join(current).strip())
+    return args
+
+
 def _parse_tournaments(html_content: str) -> List[Tournament]:
     soup = BeautifulSoup(html_content, "html.parser")
     tournaments = []
@@ -52,15 +123,26 @@ def _parse_tournaments(html_content: str) -> List[Tournament]:
         try:
             anchor = item.select_one('a[href*="eventSelected"]')
             onclick = anchor.get("href", "")
-            event_info = re.search(r"eventSelected\((.*?)\)", onclick)
+            # GREEDY to the last ")", anchored on the statement's end. A lazy match stops at
+            # the first ")", which for a name like "2026 NCAA League Tournament (Boys)" is
+            # inside the quoted argument — and truncated the row to two arguments.
+            event_info = re.search(r"eventSelected\((.*)\)\s*;?\s*$", onclick)
             if not event_info:
                 continue
 
-            params = event_info.group(1).split(",")
+            params = _split_js_args(event_info.group(1))
+
+            if len(params) < 4:
+                raise ValueError(
+                    f"eventSelected() had {len(params)} arguments, expected 4: {params}"
+                )
+
             tournament_id = int(params[0])
-            name = params[1].strip("'")
+            # TrackWrestling writes an apostrophe as a BACKTICK inside these quoted arguments -
+            # "2026 NCAA Women`s National Championships" - which is its escaping, not the name.
+            name = params[1].replace("`", "'")
             event_type = EventType.from_id(int(params[2]))
-            logo_url = params[3].strip(" '")
+            logo_url = params[3]
 
             date_span = item.select_one("div:nth-child(2) span:nth-child(2)")
             if not date_span:
@@ -101,57 +183,65 @@ def _parse_tournaments(html_content: str) -> List[Tournament]:
             )
             tournaments.append(tournament)
 
-        except Exception:
+        except Exception as exc:
+            # A malformed row should not take the whole search down with it — but it should
+            # not vanish without trace either. Silently dropping four of thirty-one results
+            # is indistinguishable from TrackWrestling having only twenty-seven.
+            _log.warning(
+                "skipped a tournament row: %s: %s", type(exc).__name__, exc, exc_info=False
+            )
             continue
 
     return tournaments
 
 
 def _parse_wrestler_data(wrestler_element) -> Wrestler:
+    """Pull one wrestler out of a mat-assignment cell.
+
+    The markup is three spans carrying `data-short-title`, in document order:
+
+        <span data-short-title="A.">        <span>Aaly</span>        </span>
+        <span data-short-title="Borbuev">   <span>Borbuev</span>     </span>
+        , 0-2 (
+        <span data-short-title="MW">        <span>Maine West</span> </span>
+        )
+
+    so first name, last name, team — with the attribute holding the abbreviation and the
+    text holding the full value.
+
+    They used to be picked by the LENGTH of the abbreviation (two characters meant a first
+    name, more meant a surname) and the team by the first span whose PARENT contained a
+    "(" — which is every span, since the parent holds the whole cell. That handed the team
+    the first name's initial, so every wrestler's team came back as "A." or "J.". Position
+    is what the markup actually guarantees.
+    """
     wrestler_id = wrestler_element.get("data-wrestler-id", "")
     team_id = wrestler_element.get("data-team-id", "")
-    spans = wrestler_element.find_all("span")
 
-    first_name_span = next(
-        (
-            span
-            for span in spans
-            if span.get("data-short-title") and len(span.get("data-short-title")) == 2
-        ),
-        None,
-    )
-    last_name_span = next(
-        (
-            span
-            for span in spans
-            if span.get("data-short-title") and len(span.get("data-short-title")) > 2
-        ),
-        None,
-    )
+    titled = [s for s in wrestler_element.find_all("span") if s.get("data-short-title")]
 
-    team_span = next(
-        (
-            span
-            for span in spans
-            if "(" in span.text or (span.parent and "(" in span.parent.text)
-        ),
-        None,
-    )
+    first_name_span = titled[0] if len(titled) > 0 else None
+    last_name_span = titled[1] if len(titled) > 1 else None
+    team_span = titled[2] if len(titled) > 2 else None
 
     full_text = wrestler_element.text
-    record = None
-    year = None
 
+    record = None
     record_match = re.search(r"(\d+-\d+)", full_text)
     if record_match:
         record = record_match.group(1)
 
-    year_match = re.search(r"(Sr|Jr|So|Fr)", full_text)
+    year = None
+    year_match = re.search(r"\b(Sr|Jr|So|Fr)\b", full_text)
     if year_match:
         year = year_match.group(1)
 
+    # The full team name is the parenthesised part; the span's attribute is its abbreviation.
     team_match = re.search(r"\((.*?)\)", full_text)
-    team_full_name = team_match.group(1).strip() if team_match else ""
+    team_full_name = (
+        team_span.text.strip() if team_span
+        else (team_match.group(1).strip() if team_match else "")
+    )
     team_short_name = team_span.get("data-short-title", "") if team_span else ""
 
     return Wrestler(
@@ -278,100 +368,94 @@ async def get_mat_assignment(
         List[Match]: A list of Match objects representing the mat assignments
     """
     # return _parse_tournament_matches(open("htmls/mat-schedule.html", "r").read())
-    async with session_manager.get_session(tournament_id) as session:
-        async with session.get(
-            f"https://www.trackwrestling.com/{tournament_type.tournament_type}/MB_MatAssignmentDisplay.jsp",
-            params={
-                "TIM": _get_timestamp(),
-                "twSessionId": "zyxwvutsrq",
-                "tournamentId": tournament_id,
-            },
-        ) as response:
-            html = await response.text()
-            return _parse_tournament_matches(html)
+    html = await session_manager.fetch(
+        "GET",
+        f"https://www.trackwrestling.com/{tournament_type.tournament_type}/MB_MatAssignmentDisplay.jsp",
+        tournament_id,
+        tournament_type,
+        params={
+            "TIM": _get_timestamp(),
+            "twSessionId": "zyxwvutsrq",
+            "tournamentId": tournament_id,
+        },
+    )
+    return _parse_tournament_matches(html)
 
 
 async def get_tournament_info(
     tournament_type: EventType, tournament_id: int
 ) -> Tournament:
-    async with session_manager.get_session(tournament_id, tournament_type) as session:
-        async with session.get(
-            f"https://www.trackwrestling.com/{tournament_type.tournament_type}/TournamentHub.jsp",
-            params={
-                "TIM": _get_timestamp(),
-                "twSessionId": "zyxwvutsrq",
-                "tournamentId": str(tournament_id),
-            },
-        ) as response:
-            html = await response.text()
-            soup = BeautifulSoup(html, "html.parser")
+    html = await session_manager.fetch(
+        "GET",
+        f"https://www.trackwrestling.com/{tournament_type.tournament_type}/TournamentHub.jsp",
+        tournament_id,
+        tournament_type,
+        params={
+            "TIM": _get_timestamp(),
+            "twSessionId": "zyxwvutsrq",
+            "tournamentId": str(tournament_id),
+        },
+    )
+    soup = BeautifulSoup(html, "html.parser")
 
-            # Find the info content section
-            content_div = soup.select_one(".hub-nav > ul > li:first-child .content")
-            if not content_div:
-                return None
-
-            # Get tournament name
-            name_elem = content_div.select_one("h3")
-            name = name_elem.text.strip() if name_elem else ""
-
-            # Get logo URL
-            logo_img = content_div.select_one(".logo-icon img")
-            logo_url = logo_img["src"] if logo_img else None
-
-            # Parse date information
-            date_p = content_div.select("p")[0]
-            date_text = date_p.text.strip()
-            dates = date_text.split(" - ") if " - " in date_text else [date_text]
-
-            start_date = parse_date(dates[0])
-            end_date = parse_date(dates[1]) if len(dates) > 1 else None
-
-            # Parse venue information
-            address_p = (
-                content_div.select("p")[1] if len(content_div.select("p")) > 1 else None
-            )
-            venue_info = parse_venue_info(address_p.text) if address_p else {}
-
-            # Look for URLs in the nav sections
-            flyer_link = soup.select_one('a[href*="event_flyer"]')
-            event_flyer_url = flyer_link["href"] if flyer_link else None
-
-            website_link = soup.select_one('a[href*="website"]')
-            website_url = website_link["href"] if website_link else None
-
-            # Determine event type from the badge/class
-            event_type_elem = soup.select_one(
-                '[class*="bg-purple-"], [class*="bg-green-"], [class*="bg-blue-"], [class*="bg-orange-"], [class*="bg-pink-"]'
-            )
-            event_type = (
-                EventType.from_id(determine_event_type(event_type_elem))
-                if event_type_elem
-                else tournament_type
-            )  # Default to Predefined
-
-            return Tournament(
-                id=tournament_id,
-                name=name,
-                event_type=event_type,
-                start_date=start_date,
-                end_date=end_date,
-                venue_name=venue_info.get("name"),
-                venue_city=venue_info.get("city"),
-                venue_state=venue_info.get("state"),
-                venue_zip=venue_info.get("zip"),
-                logo_url=logo_url,
-                event_flyer_url=event_flyer_url,
-                website_url=website_url,
-            )
-
-
-def parse_date(date_str: str) -> datetime:
-    """Parse date string into datetime object"""
-    try:
-        return datetime.strptime(date_str.strip(), "%m/%d/%Y")
-    except ValueError:
+    # Find the info content section
+    content_div = soup.select_one(".hub-nav > ul > li:first-child .content")
+    if not content_div:
         return None
+
+    # Get tournament name
+    name_elem = content_div.select_one("h3")
+    name = name_elem.text.strip() if name_elem else ""
+
+    # Get logo URL
+    logo_img = content_div.select_one(".logo-icon img")
+    logo_url = logo_img["src"] if logo_img else None
+
+    # Parse date information
+    date_p = content_div.select("p")[0]
+    date_text = date_p.text.strip()
+
+    # One date parser, not two. The hub's own could not read "03/19 - 03/21/2026"
+    # and returned null starts for every multi-day tournament.
+    start_date, end_date = _parse_date_range(date_text)
+
+    # Parse venue information
+    address_p = (
+        content_div.select("p")[1] if len(content_div.select("p")) > 1 else None
+    )
+    venue_info = parse_venue_info(address_p.text) if address_p else {}
+
+    # Look for URLs in the nav sections
+    flyer_link = soup.select_one('a[href*="event_flyer"]')
+    event_flyer_url = flyer_link["href"] if flyer_link else None
+
+    website_link = soup.select_one('a[href*="website"]')
+    website_url = website_link["href"] if website_link else None
+
+    # Determine event type from the badge/class
+    event_type_elem = soup.select_one(
+        '[class*="bg-purple-"], [class*="bg-green-"], [class*="bg-blue-"], [class*="bg-orange-"], [class*="bg-pink-"]'
+    )
+    event_type = (
+        EventType.from_id(determine_event_type(event_type_elem))
+        if event_type_elem
+        else tournament_type
+    )  # Default to Predefined
+
+    return Tournament(
+        id=tournament_id,
+        name=name,
+        event_type=event_type,
+        start_date=start_date,
+        end_date=end_date,
+        venue_name=venue_info.get("name"),
+        venue_city=venue_info.get("city"),
+        venue_state=venue_info.get("state"),
+        venue_zip=venue_info.get("zip"),
+        logo_url=logo_url,
+        event_flyer_url=event_flyer_url,
+        website_url=website_url,
+    )
 
 
 def parse_venue_info(address_text: str) -> dict:
@@ -398,178 +482,248 @@ def parse_venue_info(address_text: str) -> dict:
     return venue_info
 
 async def get_brackets(tournament_type: EventType, tournament_id: int) -> BracketData:
-    async with session_manager.get_session(tournament_id, tournament_type) as session:
-        async with session.get(
-            f"https://www.trackwrestling.com/{tournament_type.tournament_type}/BracketViewer.jsp",
-            params={
-                "TIM": _get_timestamp(),
-                "twSessionId": "zyxwvutsrq",
-                "tournamentId": tournament_id,
-            },
-        ) as response:
-            html = await response.text()
-            # open("yeah.html", "w").write(html)
-            # print("Got url " + response.url.__str__())
-            return parse_bracket_data(html)    
+    html = await session_manager.fetch(
+        "GET",
+        f"https://www.trackwrestling.com/{tournament_type.tournament_type}/BracketViewer.jsp",
+        tournament_id,
+        tournament_type,
+        params={
+            "TIM": _get_timestamp(),
+            "twSessionId": "zyxwvutsrq",
+            "tournamentId": tournament_id,
+        },
+    )
+    return parse_bracket_data(html)
+
+def _pile_payloads(script_content: str) -> List[str]:
+    """Every `str = "..."` payload in the Pile script, in document order.
+
+    A regex rather than `.split('str = "')` because the spacing around `=` is not ours to
+    rely on, and because splitting silently produces a different number of parts when it
+    changes — which is how this broke the first time.
+    """
+    return re.findall(r'str\s*=\s*"([^"]*)"', script_content)
+
+
+def _parse_templates(payload: str) -> List[Template]:
+    """Templates: 7 fields each — bracketId, templateId, name, width, height, font, pages."""
+    templates: List[Template] = []
+    if not payload:
+        return templates
+
+    entries = payload.split('~')
+
+    for i in range(0, len(entries) - 6, 7):
+        # The pages field is itself a comma-separated list of (id, name) pairs.
+        pages_data = entries[i + 6].split(',')
+        pages = [
+            BracketPage(
+                page_index=j // 2,
+                page_id=int(pages_data[j]),
+                page_name=pages_data[j + 1],
+                show_page=(pages_data[j] in ('1', '2', '4', '6')),
+            )
+            for j in range(0, len(pages_data) - 1, 2)
+        ]
+
+        templates.append(Template(
+            template_index=len(templates),
+            bracket_id=int(entries[i + 0]),
+            template_id=int(entries[i + 1]),
+            template_name=entries[i + 2],
+            bracket_width=entries[i + 3],
+            bracket_height=entries[i + 4],
+            bracket_font=entries[i + 5],
+            pages=pages,
+        ))
+
+    return templates
+
+
+def _parse_divisions(payload: str) -> List[Division]:
+    """Divisions: 2 fields each — id, name. Absent from current TrackWrestling pages."""
+    divisions: List[Division] = []
+    if not payload:
+        return divisions
+
+    entries = payload.split('~')
+
+    for i in range(0, len(entries) - 1, 2):
+        divisions.append(Division(
+            division_index=len(divisions),
+            division_id=int(entries[i]),
+            division_name=entries[i + 1],
+        ))
+
+    return divisions
+
+
+def _parse_weights(payload: str, with_division: bool) -> List[Weight]:
+    """Weights, in the shape the page layout says they are in.
+
+    Three fields - weightId, name, bracketId - is what TrackWrestling serves now.
+    Four fields - divisionId, weightId, name, bracketId - is the older shape, which came
+    with a divisions block; the division id went away when that block did.
+
+    The shape is decided by that layout, not by trying field counts against the data.
+    Weight names are usually numeric ("125"), so a list of 12 entries fits both shapes and
+    a guess picks wrong for one of them.
+    """
+    weights: List[Weight] = []
+    if not payload:
+        return weights
+
+    entries = payload.split('~')
+    stride = 4 if with_division else 3
+
+    if len(entries) % stride != 0:
+        raise ValueError(
+            f"Weights payload has {len(entries)} entries, not a multiple of {stride}: "
+            f"{entries[:8]}"
+        )
+
+    for i in range(0, len(entries), stride):
+        row = entries[i:i + stride]
+        division_id = int(row.pop(0)) if with_division else None
+        weight_id, weight_name, bracket_id = row
+        weights.append(Weight(
+            weight_index=len(weights),
+            division_id=division_id,
+            weight_id=int(weight_id),
+            weight_name=weight_name,
+            bracket_id=int(bracket_id),
+        ))
+
+    return weights
+
+
+def _parse_bracket_types(payload: str) -> List[BracketType]:
+    """Bracket types: a bare comma-separated list of ids."""
+    return [
+        BracketType(bracket_id=int(value))
+        for value in payload.split(',')
+        if value.strip().isdigit()
+    ]
+
 
 def parse_bracket_data(html_content: str) -> BracketData:
-    """
-    Parse bracket data from the HTML content into structured dataclasses.
-    
-    Args:
-        html_content: Raw HTML string containing bracket data
-        
-    Returns:
-        Tuple of (weights, templates, bracket_types) lists
+    """Parse the BracketViewer page's inline data into structured dataclasses.
+
+    The page builds its dropdowns from a handful of tilde-delimited strings assigned to a
+    variable called `str` inside a script that constructs a `Pile()`. The number of those
+    strings is NOT stable: TrackWrestling used to emit four (templates, divisions, weights,
+    bracket types) and now emits three, having dropped divisions and the division id that
+    went with each weight.
+
+    So the blocks are identified by their ROLE rather than their index — first is templates,
+    last is bracket types, and whatever sits between them is divisions-then-weights or just
+    weights. Positional indexing is what made this raise IndexError against the live site.
     """
     soup = BeautifulSoup(html_content, 'html.parser')
-    
-    # Find the script containing the data
+
     script_content = None
     for script in soup.find_all('script'):
         if script.string and 'new Pile()' in script.string:
             script_content = script.string
             break
-            
+
     if not script_content:
         raise ValueError("Could not find bracket data in HTML")
 
-    # Parse templates string (it comes first in the script)
-    templates_str = script_content.split('str = "')[1].split('";')[0]
-    templates = []
-    if templates_str:
-        entries = templates_str.split('~')
-        for i in range(0, len(entries), 7):
-            # Parse pages for this template
-            pages_data = entries[i+6].split(',')
-            pages = []
-            for j in range(0, len(pages_data), 2):
-                pages.append(BracketPage(
-                    page_index=j//2,
-                    page_id=int(pages_data[j]),
-                    page_name=pages_data[j+1],
-                    show_page=(pages_data[j] in ('1', '2', '4', '6'))
-                ))
-                
-            templates.append(Template(
-                template_index=len(templates),
-                bracket_id=int(entries[i+0]),
-                template_id=int(entries[i+1]),
-                template_name=entries[i+2],
-                bracket_width=entries[i+3],
-                bracket_height=entries[i+4],
-                bracket_font=entries[i+5],
-                pages=pages
-            ))
+    payloads = _pile_payloads(script_content)
 
-    # Parse divisions
-    divisions_str = script_content.split('str = "')[2].split('";')[0]
-    divisions = []
-    if divisions_str:
-        entries = divisions_str.split('~')
-        for i in range(0, len(entries), 2):
-            divisions.append(Division(
-                division_index=len(divisions),
-                division_id=int(entries[i]),
-                division_name=entries[i+1]
-            ))
+    if len(payloads) < 3:
+        raise ValueError(
+            f"BracketViewer gave {len(payloads)} data blocks; expected at least 3 "
+            "(templates, weights, bracket types)"
+        )
 
-    # Parse weights string 
-    weights_str = script_content.split('str = "')[3].split('";')[0]
-    weights = []
-    if weights_str:
-        entries = weights_str.split('~')
-        for i in range(0, len(entries), 4):
-            weights.append(Weight(
-                weight_index=len(weights),
-                weight_id=int(entries[i+1]),
-                weight_name=entries[i+2],
-                division_id=int(entries[i]),
-                bracket_id=int(entries[i+3])
-            ))
+    templates = _parse_templates(payloads[0])
+    bracket_types = _parse_bracket_types(payloads[-1])
+    middle = payloads[1:-1]
 
-    # Parse bracket types string  
-    bracket_types_str = script_content.split('str = "')[4].split('";')[0]
-    bracket_types = []
-    if bracket_types_str:
-        for bracket_id in bracket_types_str.split(','):
-            bracket_types.append(BracketType(bracket_id=int(bracket_id)))
+    if len(middle) == 1:
+        divisions = []
+        weights = _parse_weights(middle[0], with_division=False)
+    elif len(middle) == 2:
+        divisions = _parse_divisions(middle[0])
+        weights = _parse_weights(middle[1], with_division=True)
+    else:
+        raise ValueError(
+            f"Unrecognised BracketViewer layout: {len(payloads)} data blocks"
+        )
 
     return BracketData(
         divisions=divisions,
         weights=weights,
         templates=templates,
-        bracket_types=bracket_types
+        bracket_types=bracket_types,
     )
+
 
 def generate_bracket_url(
         tournament_type: EventType,
-        weight_id: int) -> str:
+        weight_id: int,
+        template: Template | None = None,
+        pages: Iterable[int] | None = None,
+        tw_session_id: str = "zyxwvutsrq") -> str:
+    """Build a viewable Bracket.jsp URL for one weight class.
+
+    The parameter names matter and were wrong: this sent chartId/chartWidth/chartHeight/
+    chartFontSize, which Bracket.jsp ignores. The page wants groupId with
+    bracketWidth/bracketHeight/bracketFontSize, plus includePages and templateId.
+
+    Dimensions come from the TEMPLATE when one is supplied — BracketViewer publishes them
+    per tournament (700x590 at font 8 for the NCAA Division I bracket) — rather than the
+    670x870 that was hardcoded here.
+
+    `pages` selects which parts of the bracket to render, using the page ids the template
+    carries: 0 Prelims, 2 Championship Bracket, 3 Consolation Bracket. Omitting it lets
+    TrackWrestling decide.
     """
-    Generate a URL for viewing a specific bracket based on weight and template settings.
-    
-    Args:
-        weight_id: ID of the weight class
-        template: Template object containing bracket layout info
-        tw_session_id: TrackWrestling session ID
-        base_url: Base URL for the TrackWrestling site
-        
-    Returns:
-        Complete URL for viewing the specified bracket
-    """
-    # Get timestamp in milliseconds
-    from time import time
-    current_time_ms = int(time() * 1000)
-    
-    # Get the pages that are marked as visible
-    # visible_pages = [p.page_id for p in template.pages if p.show_page]
-    # pages_str = ",".join(map(str, visible_pages))
-    
-    # Construct URL parameters
     params = {
-        "TIM": current_time_ms,
-        "twSessionId": "zyxwvutsrq",
-        "chartId": weight_id,
+        "TIM": _get_timestamp(),
+        "twSessionId": tw_session_id,
         "groupId": weight_id,
-        "chartWidth": 670,
-        "chartHeight": 870,
-        "chartFontSize": 8,
-        # "includePages": 3,
-        # "bracketWidth": template.bracket_width,
-        # "bracketHeight": template.bracket_height,
-        # "bracketFontSize": template.bracket_font,
-        # "includePages": pages_str,
-        # "templateId": template.template_id if template.template_id != 0 else ""
+        "bracketWidth": template.bracket_width if template else 700,
+        "bracketHeight": template.bracket_height if template else 590,
+        "bracketFontSize": template.bracket_font if template else 8,
+        "includePages": ",".join(str(p) for p in pages) if pages else "",
+        "templateId": template.template_id if template and template.template_id else "",
     }
-    
-    # Build query string
-    query = "&".join(f"{k}={v}" for k, v in params.items() if v != "")
-    
-    # Combine into final URL
-    # base_url: str = "https://www.trackwrestling.com/teamtournaments/"
+
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+
     return f"https://www.trackwrestling.com/{tournament_type.tournament_type}/Bracket.jsp?{query}"
 
 
 async def get_bracket_data_html(tournament_type: EventType, tournament_id: int, group_id: int, pages: Tuple[int] = None) -> str:
-    async with session_manager.get_session(tournament_id, tournament_type) as session:
-        async with session.get(
-            f"https://www.trackwrestling.com/{tournament_type.tournament_type}/AjaxFunctions.jsp",
-            params={
-                "TIM": 1734309820692,
-                "twSessionId": "zyxwvutsrq",
-                "function": "getBracket",
-                "groupId": group_id,
-                "chartId": group_id,
-                "width": 670,
-                "height": 870,
-                "font": 8,
-                "includePages": ",".join((str(p) for p in pages)) if pages else "",
-                # 4 = bottom, 5 = top
-                # "includePages": "5",
-                "templateId": 0,
-            },
-        ) as response:
-            return await response.text()
+    # Every parameter is required: an incomplete set answers "There has been an error".
+    return await session_manager.fetch(
+        "GET",
+        f"https://www.trackwrestling.com/{tournament_type.tournament_type}/AjaxFunctions.jsp",
+        tournament_id,
+        tournament_type,
+        params={
+            "TIM": _get_timestamp(),
+            "twSessionId": "zyxwvutsrq",
+            "function": "getBracket",
+            "groupId": group_id,
+            "chartId": group_id,
+            "width": 670,
+            "height": 870,
+            "font": 8,
+            "includePages": ",".join((str(p) for p in pages)) if pages else "",
+            "templateId": 0,
+        },
+    )
+
+
+async def get_bracket_sheet(tournament_type: EventType, tournament_id: int, group_id: int) -> BracketSheet:
+    """One weight's bracket, parsed into entries, bout numbers, pigtail entrants and routes."""
+    return parse_bracket_sheet(
+        await get_bracket_data_html(tournament_type, tournament_id, group_id)
+    )
 
 def determine_event_type(element) -> int:
     """Determine event type based on CSS classes"""

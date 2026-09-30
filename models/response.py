@@ -6,9 +6,10 @@ class Response(JSONResponse):
         self: "Response",
         ok: bool = False,
         data: dict = None,
-        status: int = 200,
+        error: str = None,
+        status: int = None,
     ):
-        super().__init__({
-            "ok": ok,
-            "data": data,
-        }, status=status)
+        body = {"ok": ok, "data": data}
+        if error is not None:
+            body["error"] = error
+        super().__init__(body, status=status or (200 if ok else 400))

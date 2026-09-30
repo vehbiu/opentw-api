@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8
+sanic-testing>=24.6
+pyyaml>=6
