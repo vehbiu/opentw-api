@@ -12,5 +12,7 @@ if __name__ == "__main__":
         port=port,
         debug=False,
         access_log=True,
-        workers=4
+        # One worker by default: each worker has its own cache, sessions and request throttle,
+        # so more workers means more traffic to TrackWrestling and a higher chance of a block.
+        workers=int(os.getenv("WORKERS", 1)),
     )

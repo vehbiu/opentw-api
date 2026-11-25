@@ -89,6 +89,13 @@ class Tournament(BaseClass):
     logo_url: Optional[str]
     event_flyer_url: Optional[str]
     website_url: Optional[str]
+    venue_street: Optional[str] = None
+    registration_url: Optional[str] = None
+    # Where the data came from: "trackwrestling", or "flowrestling" for tournaments
+    # TrackWrestling has handed over (then the FloWrestling event id and page are set too).
+    source: str = "trackwrestling"
+    flowrestling_event_id: Optional[str] = None
+    flowrestling_url: Optional[str] = None
 
     def as_dict(self: "Tournament") -> dict:
         return {
@@ -122,6 +129,19 @@ class Tournament(BaseClass):
 #     weights: List[Weight]
 
 @dataclass
+class TeamScore(BaseClass):
+    rank: int
+    team: str
+    score: float
+    # Open tournaments only.
+    abbreviation: Optional[str] = None
+    # FloWrestling only: the team's id, and the standings group when a tournament scores
+    # several (one per division on open tournaments).
+    team_id: Optional[str] = None
+    group: Optional[str] = None
+
+
+@dataclass
 class BracketPage(BaseClass):
     page_index: int
     page_id: int  
@@ -138,23 +158,25 @@ class Template(BaseClass):
     bracket_height: int 
     bracket_font: int
     pages: List[BracketPage]
+    # Freestyle tournaments only.
+    bracket_rows: Optional[int] = None
 
 @dataclass
 class Division(BaseClass):
     division_index: int
-    division_id: int
+    division_id: int | str
     division_name: str
 
 @dataclass
 class Weight(BaseClass):
     weight_index: int
-    weight_id: int
+    weight_id: int | str
     weight_name: str
-    bracket_id: int
+    bracket_id: int | str
 
     # Only open tournaments send divisions, so only their weights carry a division id.
     # Predefined and team tournaments leave it as None.
-    division_id: Optional[int] = None
+    division_id: Optional[int | str] = None
 
 @dataclass
 class BracketType(BaseClass):
