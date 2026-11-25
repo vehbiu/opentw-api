@@ -64,8 +64,8 @@ GET /tournaments/{tournament_type}/{tournament_id}/matches
 ```
 Returns current match assignments and statuses for a tournament. Only populated while the
 tournament is running. On TrackWrestling, team tournaments don't have mat assignments and
-return 404. On FloWrestling this reads the live mat feed, which hasn't yet been checked
-against a running tournament.
+return 404. On FloWrestling this reads the live mat feed: the bout wrestling now on each mat
+is `in_progress`, the next `on_deck`, and every bout queued behind it `in_hole`.
 
 ### Team Scores
 ```

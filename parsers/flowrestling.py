@@ -548,42 +548,54 @@ async def get_stats(event_id: str, kind: str, stat: Optional[str] = None,
 # Live mats
 # ---------------------------------------------------------------------------------------------
 
-def _wrestler(athlete: Optional[dict]) -> Optional[Wrestler]:
-    if not athlete:
-        return None
-    team = athlete.get("team") or {}
-    first, _, last = (athlete.get("name") or "").partition(" ")
-    return Wrestler(id=athlete.get("id", ""), first_name=first, last_name=last,
-                    team=Team(id=team.get("id", ""), name=team.get("name", ""), shortName=team.get("abbr", "")))
+def _wrestler(participant: Optional[dict]) -> Wrestler:
+    """A live bout's wrestler; an empty one while the slot is still waiting on a result."""
+    if not participant:
+        return Wrestler(id="", first_name="TBD", last_name="", team=Team(id="", name="", shortName=""))
+    team = participant.get("team") or {}
+    return Wrestler(
+        id=participant.get("id") or "",
+        first_name=participant.get("firstName") or "",
+        last_name=participant.get("lastName") or "",
+        team=Team(id=team.get("id") or "", name=team.get("name") or "", shortName=team.get("abbreviation") or ""),
+    )
+
+
+# FloWrestling's activityStatus for bouts waiting on a mat. "assigned" is every bout queued
+# behind the one on deck; TrackWrestling only has "in the hole" for those.
+_MAT_STATUSES = {"live": "in_progress", "on-deck": "on_deck", "assigned": "in_hole"}
 
 
 @ttl_cache(5)
 async def get_mat_assignments(event_id: str) -> List[Match]:
     """Bouts on each mat while the tournament is running (FloWrestling "areas").
 
-    Built from FloWrestling's bout schema, which its results use; the live feed couldn't be
-    checked against a running tournament yet, so unknown shapes are logged and skipped.
+    Each area is {"area": {...name...}, "activities": [{"activity": {...}}]}, the activity
+    holding the bout's status and number and, in "detail", the bout itself.
     """
     reply = await session_manager.flo(_hub(event_id, "areas", "live"))
     matches = []
-    for index, area in enumerate(reply.get("data") or [], start=1):
-        name = str(area.get("name") or area.get("title") or index)
-        number = re.search(r"\d+", name)
-        bouts = next((area[k] for k in ("bouts", "items", "upcomingBouts", "matches") if isinstance(area.get(k), list)), None)
-        if bouts is None:
-            _log.warning("unrecognised FloWrestling area: %s", sorted(area)[:10])
+    for index, entry in enumerate(reply.get("data") or [], start=1):
+        area = entry.get("area") or {}
+        activities = entry.get("activities")
+        if not isinstance(activities, list):
+            _log.warning("unrecognised FloWrestling area: %s", sorted(entry)[:10])
             continue
-        for position, bout in enumerate(bouts):
-            if not isinstance(bout, dict) or "athlete1" not in bout:
-                continue
-            number_text = str(bout.get("boutNumber") or "")
+        number = re.search(r"\d+", str(area.get("name") or ""))
+        for item in activities:
+            activity = (item or {}).get("activity") or {}
+            detail = activity.get("detail") or {}
+            status = _MAT_STATUSES.get(activity.get("activityStatus"))
+            if status is None or detail.get("detailType") != "wrestling-bout":
+                continue  # finished, or not a bout (team matchups, breaks)
+            bout_number = str(activity.get("number") or "")
             matches.append(Match(
                 mat=int(number.group()) if number else index,
-                bout=int(number_text) if number_text.isdigit() else 0,
-                status="in_progress" if position == 0 else "on_deck" if position == 1 else "in_hole",
-                weight_class=bout.get("weightClass") or "",
-                round=bout.get("round") or "",
-                wrestler1=_wrestler(bout.get("athlete1")),
-                wrestler2=_wrestler(bout.get("athlete2")),
+                bout=int(bout_number) if bout_number.isdigit() else 0,
+                status=status,
+                weight_class=detail.get("weightClassName") or "",
+                round=detail.get("roundName") or "",
+                wrestler1=_wrestler(detail.get("topEventParticipant")),
+                wrestler2=_wrestler(detail.get("bottomEventParticipant")),
             ))
     return matches
